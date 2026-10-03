@@ -98,6 +98,7 @@ write memory
 ```
 
 ![Configuration de Siege-R1](captures/09-config-frr1.png)
+![Configuration d'Agence-R2](captures/09-config-frr2.png)
 ![Ping entre les deux routeurs](captures/10-ping-r1-r2.png)
 
 ### 5.3 VLAN sur le commutateur du siège
@@ -155,6 +156,8 @@ PC-Compta>    ip 192.168.20.10 255.255.255.0 192.168.20.1
 SRV-1>        ip 192.168.30.10 255.255.255.0 192.168.30.1
 ```
 
+![Configuration de PC-Direction](captures/15a-config-pc-direction.png)
+
 Sur un VPCS, la commande `save` est indispensable après chaque configuration : sans elle, l'adresse est perdue à l'arrêt du poste.
 
 ### 5.6 Site de l'agence
@@ -169,7 +172,7 @@ L'agence reprend le même principe que le siège, avec deux VLAN.
 | 1 | 10 | access | PC-Agence1 |
 | 2 | 20 | access | PC-Invite |
 
-![VLAN du Switch2](captures/17-vlan-switch2.png)
+![VLAN du Switch2](captures/12-vlan-switch2.png)
 
 **Agence-R2** : sous-interfaces VLAN sur `eth1` (shell Linux), puis adresses et lien WAN dans FRR.
 
@@ -207,7 +210,8 @@ PC-Agence1> ip 192.168.110.10 255.255.255.0 192.168.110.1
 PC-Invite>  ip 192.168.120.10 255.255.255.0 192.168.120.1
 ```
 
-![Configuration d'Agence-R2](captures/18-config-agence-r2.png)
+![Configuration d'Agence-R2](captures/19-config-agence-r2.png)
+![Configuration des postes de l'agence et ping vers leurs passerelles](captures/20-ping-agence.png)
 
 ### 5.7 Routage dynamique OSPF
 
@@ -238,10 +242,9 @@ end
 write memory
 ```
 
-Vérification : `show ip ospf neighbor` montre le voisin `2.2.2.2` à l'état `Full`, et `show ip route` sur Siege-R1 contient deux routes OSPF apprises via `10.0.0.2` (réseaux `192.168.110.0/24` et `192.168.120.0/24`).
+Vérification sur Siege-R1 : `show ip ospf neighbor` montre le voisin `2.2.2.2` à l'état `Full`, et `show ip route ospf` contient deux routes apprises via `10.0.0.2` (réseaux `192.168.110.0/24` et `192.168.120.0/24`).
 
-![Voisin OSPF à l'état Full](captures/19-ospf-voisin.png)
-![Routes OSPF vers l'agence](captures/20-table-routage-ospf.png)
+![Voisin OSPF et routes apprises sur Siege-R1](captures/21-ospf.png)
 
 ### 5.8 Persistance des configurations
 
@@ -301,8 +304,7 @@ La configuration FRR est ensuite enregistrée avec `write memory` dans vtysh, pu
 
 Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paquets traversent un routeur : le routage entre VLAN fonctionne. Le TTL de 62 vers l'agence montre qu'ils en traversent deux (Siege-R1 puis Agence-R2) : le routage entre les deux sites fonctionne.
 
-![Ping vers la passerelle du VLAN 10](captures/15-ping-vlan10.png)
-![Routage entre VLAN](captures/16-routage-inter-vlan.png)
+![Pings de PC-Direction vers sa passerelle et les autres VLAN](captures/16-routage-inter-vlan.png)
 ![Ping du siège vers l'agence](captures/22-ping-siege-agence.png)
 
 ## 7. Problèmes rencontrés et solutions
