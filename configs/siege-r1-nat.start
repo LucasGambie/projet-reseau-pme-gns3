@@ -1,0 +1,7 @@
+#!/bin/sh
+
+ip link set eth2 up
+
+udhcpc -i eth2 -b
+
+iptables -t nat -C POSTROUTING -o eth2 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o eth2 -j MASQUERADE

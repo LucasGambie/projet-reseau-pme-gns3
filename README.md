@@ -2,7 +2,7 @@
 
 Projet personnel de conception et de mise en place d'une infrastructure réseau d'entreprise, entièrement virtualisée avec GNS3 : un siège et une agence reliés par un lien WAN, avec segmentation en VLAN et routage dynamique entre les sites.
 
-> **État d'avancement** : les deux sites sont opérationnels (VLAN, passerelles, routage inter-VLAN) et reliés par OSPF. Les configurations survivent à un redémarrage des routeurs. NAT, ACL et services réseau sont à venir (voir la section « Suite du projet »).
+> **État d'avancement** : les deux sites sont opérationnels (VLAN, passerelles, routage inter-VLAN), reliés par OSPF, et sortent sur Internet par un NAT au siège. Les configurations survivent à un redémarrage des routeurs. DHCP, DNS et ACL sont à venir (voir la section « Suite du projet »).
 
 ---
 
@@ -12,6 +12,7 @@ Projet personnel de conception et de mise en place d'une infrastructure réseau 
 - Segmenter le réseau du siège par service (Direction, Compta/RH, Serveurs) grâce aux VLAN
 - Faire communiquer les VLAN entre eux via un routeur
 - Relier le siège et l'agence par un lien WAN et mettre en place le routage dynamique (OSPF)
+- Donner un accès à Internet aux deux sites par un seul point de sortie (NAT au siège)
 - Rendre les configurations persistantes après un redémarrage
 - Documenter chaque étape, avec les tests et les problèmes rencontrés
 
@@ -34,6 +35,7 @@ Projet personnel de conception et de mise en place d'une infrastructure réseau 
 - `Siege-R1` : routeur du siège
 - `Agence-R2` : routeur de l'agence
 - `Switch1` (siège) et `Switch2` (agence)
+- `NAT1` : nœud NAT de GNS3, qui simule l'accès à Internet, relié à Siege-R1
 - Siège : `PC-Direction`, `PC-Compta`, `SRV-1`
 - Agence : `PC-Agence1`, `PC-Invite`
 
@@ -45,6 +47,7 @@ Câblage :
 |---|---|---|---|
 | Siege-R1 | eth0 | Agence-R2 | eth0 (lien WAN) |
 | Siege-R1 | eth1 | Switch1 | Ethernet0 (trunk) |
+| Siege-R1 | eth2 | NAT1 | nat0 (sortie Internet) |
 | Switch1 | Ethernet1 | PC-Direction | Ethernet0 |
 | Switch1 | Ethernet2 | PC-Compta | Ethernet0 |
 | Switch1 | Ethernet3 | SRV-1 | Ethernet0 |
@@ -55,6 +58,8 @@ Câblage :
 ## 4. Plan d'adressage
 
 **Lien WAN** : `10.0.0.0/30` (Siege-R1 `10.0.0.1`, Agence-R2 `10.0.0.2`)
+
+**Sortie Internet** : `eth2` de Siege-R1, adresse obtenue en DHCP auprès du nœud NAT de GNS3 (réseau `192.168.42.0/24`, passerelle `192.168.42.1`)
 
 **Siège**
 
@@ -284,9 +289,51 @@ La configuration FRR est ensuite enregistrée avec `write memory` dans vtysh, pu
 | Fichier | Contenu |
 |---|---|
 | `siege-r1-frr.conf` | Configuration FRR de Siege-R1 |
-| `siege-r1-vlan.start` | Script de démarrage de Siege-R1 |
+| `siege-r1-vlan.start` | Script de démarrage des sous-interfaces VLAN de Siege-R1 |
+| `siege-r1-nat.start` | Script de démarrage du NAT de Siege-R1 (adresse DHCP et règle `iptables`) |
 | `agence-r2-frr.conf` | Configuration FRR d'Agence-R2 |
 | `agence-r2-vlan.start` | Script de démarrage d'Agence-R2 |
+
+### 5.9 NAT et accès à Internet
+
+Un seul point de sortie vers Internet, au siège, est utilisé par les deux sites, comme dans une vraie PME.
+
+**1. Nœud NAT dans GNS3.** Le nœud `NAT1` est relié à `eth2` de Siege-R1. Il joue le rôle de box Internet et distribue une adresse en DHCP.
+
+**2. Adresse et NAT sur Siege-R1.** Sous Linux, `udhcpc` récupère l'adresse et la route par défaut, et `iptables` masque les adresses privées derrière celle de `eth2` :
+
+```
+ip link set eth2 up
+udhcpc -i eth2
+iptables -t nat -A POSTROUTING -o eth2 -j MASQUERADE
+```
+
+**3. Persistance.** Comme pour les VLAN, ces commandes sont mises dans un script de démarrage `/etc/local.d/nat.start`, que le service `local` exécute à chaque boot. Le test `iptables -C` évite d'ajouter la règle en double :
+
+```
+#!/bin/sh
+ip link set eth2 up
+udhcpc -i eth2 -b
+iptables -t nat -C POSTROUTING -o eth2 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o eth2 -j MASQUERADE
+```
+
+![Adresse, route par défaut et règle NAT sur Siege-R1](captures/25-nat-siege-r1.png)
+
+**4. Route par défaut vers l'agence.** Siege-R1 annonce sa route par défaut en OSPF, et Agence-R2 l'apprend automatiquement :
+
+```
+router ospf
+ default-information originate
+```
+
+Sur Agence-R2, `show ip route` contient alors `O>* 0.0.0.0/0 via 10.0.0.1`.
+
+![Route par défaut apprise en OSPF sur Agence-R2](captures/26-route-defaut-agence.png)
+
+**5. Tests.** Un poste du siège (SRV-1) et un poste de l'agence (PC-Agence1) joignent `8.8.8.8`. Sur Siege-R1, les compteurs de la règle `MASQUERADE` augmentent à chaque ping, ce qui prouve que le NAT traite bien les paquets des réseaux privés. Le NAT a aussi été vérifié après un redémarrage de Siege-R1.
+
+![Ping vers Internet depuis SRV-1](captures/27-ping-internet-srv1.png)
+![Ping vers Internet depuis PC-Agence1 et compteurs du NAT](captures/28-ping-internet-agence.png)
 
 ## 6. Tests et validation
 
@@ -300,6 +347,11 @@ La configuration FRR est ensuite enregistrée avec `write memory` dans vtysh, pu
 | SRV-1 vers PC-Agence1 (`192.168.110.10`) | OK, TTL 62 |
 | SRV-1 vers PC-Invite (`192.168.120.10`) | OK, TTL 62 |
 | Voisin OSPF `2.2.2.2` depuis Siege-R1 | État `Full` |
+| Siege-R1 vers `8.8.8.8` et `google.com` | OK (la résolution de nom fonctionne) |
+| SRV-1 vers `8.8.8.8` | OK, TTL 60 |
+| PC-Agence1 vers `8.8.8.8` | OK, TTL 58 |
+| Route par défaut `0.0.0.0/0` sur Agence-R2 | Apprise en OSPF via `10.0.0.1` |
+| Compteurs de la règle `MASQUERADE` | Augmentent à chaque ping des postes (siège et agence) |
 | Tous les tests après redémarrage des routeurs | OK |
 
 Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paquets traversent un routeur : le routage entre VLAN fonctionne. Le TTL de 62 vers l'agence montre qu'ils en traversent deux (Siege-R1 puis Agence-R2) : le routage entre les deux sites fonctionne.
@@ -318,6 +370,8 @@ Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paq
 | Configuration des routeurs perdue après la fermeture de GNS3 | Sous-interfaces VLAN non persistantes et configuration FRR non enregistrée | Scripts de démarrage `/etc/local.d/vlan.start` et `write memory` (voir 5.8) |
 | `frr.conf` vide après un arrêt brutal de la GNS3 VM | Le fichier n'avait pas été écrit sur le disque avant le plantage | Restauration depuis la copie de secours `frr.conf.sav` créée par FRR, puis `write memory` et `sync` |
 | « Address already in use » sur le port de console d'un routeur | Processus bloqué dans la GNS3 VM figée, qui gardait le port occupé | Arrêt propre de la GNS3 VM puis redémarrage, et démarrage des routeurs un par un |
+| Console d'un routeur qui se ferme en boucle, port 5000 injoignable en `telnet` | Le serveur GNS3 ne relançait plus correctement la console du nœud | Fermeture puis relance de GNS3, qui a rétabli la console. Un `ping` de la GNS3 VM permet de vérifier qu'elle répond |
+| Voisin OSPF absent sur Agence-R2, route par défaut non reçue | Siege-R1 n'était pas démarré, il n'y avait donc personne avec qui échanger | Démarrage de Siege-R1 : voisin `Full` et route `0.0.0.0/0` reçue au bout de quelques minutes |
 
 ## 8. Limites connues
 
@@ -331,8 +385,8 @@ Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paq
 - [x] Agence : sous-interfaces VLAN sur Agence-R2, configuration de Switch2 et des postes
 - [x] Routage dynamique OSPF entre les deux sites
 - [x] Rendre les VLAN persistants au démarrage
+- [x] NAT vers un accès « Internet » simulé, avec route par défaut diffusée en OSPF
 - [ ] DHCP et DNS
-- [ ] NAT vers un accès « Internet » simulé
 - [ ] Filtrage entre VLAN avec des ACL
 - [ ] VPN site à site
 - [ ] Supervision et sauvegarde automatisée des configurations (sauvegarde manuelle déjà faite dans `configs/`)
