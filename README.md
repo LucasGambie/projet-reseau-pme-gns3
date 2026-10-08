@@ -2,7 +2,7 @@
 
 Projet personnel de conception et de mise en place d'une infrastructure réseau d'entreprise, entièrement virtualisée avec GNS3 : un siège et une agence reliés par un lien WAN, avec segmentation en VLAN et routage dynamique entre les sites.
 
-> **État d'avancement** : les deux sites sont opérationnels (VLAN, passerelles, routage inter-VLAN), reliés par OSPF, et sortent sur Internet par un NAT au siège. Les configurations survivent à un redémarrage des routeurs. DHCP, DNS et ACL sont à venir (voir la section « Suite du projet »).
+> **État d'avancement** : les deux sites sont opérationnels (VLAN, passerelles, routage inter-VLAN), reliés par OSPF, et sortent sur Internet par un NAT au siège. Les configurations survivent à un redémarrage des routeurs. Le DHCP et le DNS sont en place sur les deux sites. Les ACL sont à venir (voir la section « Suite du projet »).
 
 ---
 
@@ -14,6 +14,7 @@ Projet personnel de conception et de mise en place d'une infrastructure réseau 
 - Relier le siège et l'agence par un lien WAN et mettre en place le routage dynamique (OSPF)
 - Donner un accès à Internet aux deux sites par un seul point de sortie (NAT au siège)
 - Rendre les configurations persistantes après un redémarrage
+- Distribuer les adresses (DHCP) et résoudre les noms (DNS) sur chaque site, avec un serveur léger sur le routeur
 - Documenter chaque étape, avec les tests et les problèmes rencontrés
 
 ## 2. Environnement
@@ -23,7 +24,7 @@ Projet personnel de conception et de mise en place d'une infrastructure réseau 
 | Poste hôte | Windows 11, 16 Go de RAM, processeur à 12 threads |
 | Simulateur | GNS3 2.2.61 |
 | Hyperviseur | VirtualBox 7.2.20 |
-| Serveur GNS3 | GNS3 VM (4 vCPU, 4 Go de RAM), accessible en `192.168.56.101` |
+| Serveur GNS3 | GNS3 VM (2 vCPU, 4 Go de RAM), accessible en `192.168.56.101` |
 | Routeurs | FRRouting 8.2.2 (images QEMU, Alpine Linux 3.16) |
 | Commutateurs | Ethernet switch intégré à GNS3 (VLAN 802.1Q) |
 | Postes et serveur | VPCS (PC virtuels légers) |
@@ -293,6 +294,8 @@ La configuration FRR est ensuite enregistrée avec `write memory` dans vtysh, pu
 | `siege-r1-nat.start` | Script de démarrage du NAT de Siege-R1 (adresse DHCP et règle `iptables`) |
 | `agence-r2-frr.conf` | Configuration FRR d'Agence-R2 |
 | `agence-r2-vlan.start` | Script de démarrage d'Agence-R2 |
+| `siege-r1-dnsmasq.conf` | Configuration DHCP et DNS de Siege-R1 (voir 5.10) |
+| `agence-r2-dnsmasq.conf` | Configuration DHCP et DNS d'Agence-R2 (voir 5.10) |
 
 ### 5.9 NAT et accès à Internet
 
@@ -335,6 +338,64 @@ Sur Agence-R2, `show ip route` contient alors `O>* 0.0.0.0/0 via 10.0.0.1`.
 ![Ping vers Internet depuis SRV-1](captures/27-ping-internet-srv1.png)
 ![Ping vers Internet depuis PC-Agence1 et compteurs du NAT](captures/28-ping-internet-agence.png)
 
+### 5.10 DHCP et DNS
+
+Chaque routeur sert de serveur DHCP et DNS pour son site avec **dnsmasq**, un petit service léger adapté à ce type de maquette. Le VLAN 30 (serveurs) n'est pas concerné : SRV-1 garde son adresse fixe `192.168.30.10`. Les postes des VLAN 10 et 20 passent en DHCP : les adresses `.10` du plan d'adressage ne servent plus que de configuration de départ.
+
+**1. Plages d'adresses.** Les premières adresses (de `.1` à `.99`) restent libres pour les équipements à adresse fixe.
+
+| Site | VLAN | Plage DHCP | Passerelle et DNS |
+|---|---|---|---|
+| Siège | 10 | 192.168.10.100 à .200 | 192.168.10.1 |
+| Siège | 20 | 192.168.20.100 à .200 | 192.168.20.1 |
+| Agence | 10 | 192.168.110.100 à .200 | 192.168.110.1 |
+| Agence | 20 | 192.168.120.100 à .200 | 192.168.120.1 |
+
+**2. Installation et configuration.** Sur chaque routeur, dnsmasq est installé avec `apk add dnsmasq`, puis configuré dans `/etc/dnsmasq.conf` (voir `configs/siege-r1-dnsmasq.conf` et `configs/agence-r2-dnsmasq.conf`). Extrait pour Agence-R2 :
+
+```
+interface=eth1.10
+interface=eth1.20
+bind-dynamic
+
+no-resolv
+server=8.8.8.8
+
+dhcp-range=set:vlan10,192.168.110.100,192.168.110.200,255.255.255.0,12h
+dhcp-range=set:vlan20,192.168.120.100,192.168.120.200,255.255.255.0,12h
+
+dhcp-option=tag:vlan10,option:router,192.168.110.1
+dhcp-option=tag:vlan10,option:dns-server,192.168.110.1
+dhcp-option=tag:vlan20,option:router,192.168.120.1
+dhcp-option=tag:vlan20,option:dns-server,192.168.120.1
+```
+
+- `interface` limite dnsmasq aux sous-interfaces des VLAN d'utilisateurs, et `bind-dynamic` lui permet de démarrer même si une sous-interface n'est pas encore montée.
+- `no-resolv` et `server=8.8.8.8` : les requêtes DNS des clients sont relayées vers `8.8.8.8` sans dépendre du fichier `/etc/resolv.conf` du routeur (voir la section 7).
+- Chaque `dhcp-option` indique aux clients la passerelle et le serveur DNS, c'est-à-dire le routeur lui-même.
+
+**3. Démarrage automatique.** Le service est vérifié avec `dnsmasq --test`, puis démarré et activé au boot :
+
+```
+dnsmasq --test
+rc-service dnsmasq start
+rc-update add dnsmasq default
+sync
+```
+
+![dnsmasq sur Siege-R1](captures/29-dnsmasq-siege-r1.png)
+![dnsmasq sur Agence-R2](captures/30-dnsmasq-agence-r2.png)
+
+**4. Tests.** Sur un poste VPCS, `ip dhcp` récupère l'adresse, puis `ping google.com` vérifie à la fois la résolution de noms et la sortie sur Internet.
+
+![DHCP et DNS sur PC-Compta](captures/31-dhcp-dns-pc-compta.png)
+![DHCP et DNS sur PC-Agence1](captures/32-dhcp-dns-pc-agence1.png)
+![DHCP et DNS sur PC-Invite](captures/33-dhcp-dns-pc-invite.png)
+
+**5. Après redémarrage.** Les deux routeurs ont été redémarrés : dnsmasq repart tout seul (`rc-status` affiche `started`), la configuration de Siege-R1 contient toujours `no-resolv` et `server=8.8.8.8` (capture ci-dessous), et les postes obtiennent à nouveau une adresse et résolvent les noms.
+
+![Siege-R1 après redémarrage](captures/34-apres-redemarrage-siege-r1.png)
+
 ## 6. Tests et validation
 
 | Test | Résultat |
@@ -352,6 +413,10 @@ Sur Agence-R2, `show ip route` contient alors `O>* 0.0.0.0/0 via 10.0.0.1`.
 | PC-Agence1 vers `8.8.8.8` | OK, TTL 58 |
 | Route par défaut `0.0.0.0/0` sur Agence-R2 | Apprise en OSPF via `10.0.0.1` |
 | Compteurs de la règle `MASQUERADE` | Augmentent à chaque ping des postes (siège et agence) |
+| PC-Compta : `ip dhcp` puis `ping google.com` | Adresse `192.168.20.161`, DNS `192.168.20.1`, ping OK |
+| PC-Agence1 : `ip dhcp` puis `ping google.com` | Adresse `192.168.110.163`, DNS `192.168.110.1`, ping OK |
+| PC-Invite : `ip dhcp` puis `ping google.com` | Adresse `192.168.120.164`, DNS `192.168.120.1`, ping OK |
+| DHCP et DNS sur les 4 postes après redémarrage des routeurs | OK |
 | Tous les tests après redémarrage des routeurs | OK |
 
 Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paquets traversent un routeur : le routage entre VLAN fonctionne. Le TTL de 62 vers l'agence montre qu'ils en traversent deux (Siege-R1 puis Agence-R2) : le routage entre les deux sites fonctionne.
@@ -371,6 +436,8 @@ Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paq
 | `frr.conf` vide après un arrêt brutal de la GNS3 VM | Le fichier n'avait pas été écrit sur le disque avant le plantage | Restauration depuis la copie de secours `frr.conf.sav` créée par FRR, puis `write memory` et `sync` |
 | « Address already in use » sur le port de console d'un routeur | Processus bloqué dans la GNS3 VM figée, qui gardait le port occupé | Arrêt propre de la GNS3 VM puis redémarrage, et démarrage des routeurs un par un |
 | Console d'un routeur qui se ferme en boucle, port 5000 injoignable en `telnet` | Le serveur GNS3 ne relançait plus correctement la console du nœud | Fermeture puis relance de GNS3, qui a rétabli la console. Un `ping` de la GNS3 VM permet de vérifier qu'elle répond |
+| Pas de résolution de noms sur Siege-R1 alors que le ping vers `8.8.8.8` fonctionnait | `/etc/resolv.conf` vide, donc dnsmasq n'avait aucun serveur DNS vers qui relayer | Ajout de `no-resolv` et `server=8.8.8.8` dans `dnsmasq.conf` : le DNS des clients ne dépend plus de `resolv.conf`. Après redémarrage, `udhcpc` remplit `resolv.conf` tout seul avec le DNS du nœud NAT |
+| GNS3 VM figée (`rcu_preempt kthread starved`) puis un routeur en `kernel panic` au démarrage (« IO-APIC + timer doesn't work ») | Hôte saturé, le noyau n'obtenait plus assez de temps CPU pour initialiser son timer | Arrêt propre des nœuds et de la GNS3 VM, passage de la VM de 4 à 2 vCPU, redémarrage des nœuds un par un |
 | Voisin OSPF absent sur Agence-R2, route par défaut non reçue | Siege-R1 n'était pas démarré, il n'y avait donc personne avec qui échanger | Démarrage de Siege-R1 : voisin `Full` et route `0.0.0.0/0` reçue au bout de quelques minutes |
 
 ## 8. Limites connues
@@ -386,7 +453,7 @@ Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paq
 - [x] Routage dynamique OSPF entre les deux sites
 - [x] Rendre les VLAN persistants au démarrage
 - [x] NAT vers un accès « Internet » simulé, avec route par défaut diffusée en OSPF
-- [ ] DHCP et DNS
+- [x] DHCP et DNS (dnsmasq sur chaque routeur)
 - [ ] Filtrage entre VLAN avec des ACL
 - [ ] VPN site à site
 - [ ] Supervision et sauvegarde automatisée des configurations (sauvegarde manuelle déjà faite dans `configs/`)
