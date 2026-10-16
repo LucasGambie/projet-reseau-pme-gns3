@@ -2,7 +2,7 @@
 
 Projet personnel de conception et de mise en place d'une infrastructure réseau d'entreprise, entièrement virtualisée avec GNS3 : un siège et une agence reliés par un lien WAN, avec segmentation en VLAN et routage dynamique entre les sites.
 
-> **État d'avancement** : les deux sites sont opérationnels (VLAN, passerelles, routage inter-VLAN), reliés par OSPF, et sortent sur Internet par un NAT au siège. Les configurations survivent à un redémarrage des routeurs. Le DHCP et le DNS sont en place sur les deux sites. Les ACL sont à venir (voir la section « Suite du projet »).
+> **État d'avancement** : les deux sites sont opérationnels (VLAN, passerelles, routage inter-VLAN), reliés par OSPF, et sortent sur Internet par un NAT au siège. Les configurations survivent à un redémarrage des routeurs. Le DHCP, le DNS et le filtrage entre VLAN (ACL) sont en place sur les deux sites. La suite est détaillée dans la section « Suite du projet ».
 
 ---
 
@@ -15,6 +15,7 @@ Projet personnel de conception et de mise en place d'une infrastructure réseau 
 - Donner un accès à Internet aux deux sites par un seul point de sortie (NAT au siège)
 - Rendre les configurations persistantes après un redémarrage
 - Distribuer les adresses (DHCP) et résoudre les noms (DNS) sur chaque site, avec un serveur léger sur le routeur
+- Contrôler les flux entre les VLAN et vers Internet avec des règles de filtrage (iptables)
 - Documenter chaque étape, avec les tests et les problèmes rencontrés
 
 ## 2. Environnement
@@ -296,6 +297,8 @@ La configuration FRR est ensuite enregistrée avec `write memory` dans vtysh, pu
 | `agence-r2-vlan.start` | Script de démarrage d'Agence-R2 |
 | `siege-r1-dnsmasq.conf` | Configuration DHCP et DNS de Siege-R1 (voir 5.10) |
 | `agence-r2-dnsmasq.conf` | Configuration DHCP et DNS d'Agence-R2 (voir 5.10) |
+| `siege-r1-firewall.start` | Règles de filtrage de Siege-R1 (voir 5.11) |
+| `agence-r2-firewall.start` | Règles de filtrage d'Agence-R2 (voir 5.11) |
 
 ### 5.9 NAT et accès à Internet
 
@@ -396,6 +399,94 @@ sync
 
 ![Siege-R1 après redémarrage](captures/34-apres-redemarrage-siege-r1.png)
 
+### 5.11 Filtrage entre VLAN (ACL)
+
+Les routeurs sont des Alpine Linux : il n'y a pas d'ACL « à la Cisco », le filtrage se fait avec **iptables**, sur la chaîne `FORWARD`, qui contient le trafic traversant le routeur. Le trafic destiné au routeur lui-même (DHCP, DNS) passe par une autre chaîne (`INPUT`) et n'est donc pas touché par ces règles.
+
+**1. La politique.**
+
+| Source | Peut atteindre | Bloqué |
+|---|---|---|
+| Direction (VLAN 10 siège) | Tout : Compta, Serveurs, agence, Internet | Rien |
+| Compta (VLAN 20 siège) | Serveurs, Internet | Direction |
+| Serveurs (VLAN 30) | Internet | Connexions initiées vers Direction et Compta |
+| Agence1 (VLAN 10 agence) | Serveurs du siège, Internet | Direction et Compta |
+| Invités (VLAN 20 agence) | Internet seulement | Tous les réseaux internes (siège et agence) |
+
+**2. Les principes.**
+
+- La première règle laisse passer les **réponses aux connexions déjà autorisées** (`ESTABLISHED,RELATED`). Elle est indispensable : sans elle, un ping autorisé n'aurait jamais de réponse. C'est ce qui rend le filtrage « à état » : la Direction peut joindre la Compta, mais la Compta ne peut pas ouvrir de connexion vers la Direction.
+- Les règles sont lues **dans l'ordre**, de haut en bas, et la première qui correspond s'applique. L'ordre compte donc.
+- La politique par défaut de la chaîne reste `ACCEPT`, et le blocage est une règle `DROP` explicite placée en dernier. En cas d'erreur de configuration, `iptables -F FORWARD` remet la chaîne à zéro sans perdre l'accès aux routeurs.
+
+**3. Les règles de Siege-R1.** Le siège décide pour ses VLAN, pour les serveurs et pour le trafic qui arrive de l'agence (`eth0`). `eth2` est la sortie Internet.
+
+```
+iptables -F FORWARD
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -i eth1.10 -j ACCEPT
+iptables -A FORWARD -i eth1.20 -d 192.168.30.0/24 -j ACCEPT
+iptables -A FORWARD -i eth1.20 -o eth2 -j ACCEPT
+iptables -A FORWARD -i eth1.30 -o eth2 -j ACCEPT
+iptables -A FORWARD -i eth0 -s 10.0.0.2 -o eth2 -j ACCEPT
+iptables -A FORWARD -i eth0 -s 192.168.110.0/24 -d 192.168.30.0/24 -j ACCEPT
+iptables -A FORWARD -i eth0 -s 192.168.110.0/24 -o eth2 -j ACCEPT
+iptables -A FORWARD -i eth0 -s 192.168.120.0/24 -o eth2 -j ACCEPT
+iptables -A FORWARD -j DROP
+```
+
+- `eth1.10` : la Direction peut tout faire.
+- `eth1.20` : la Compta n'atteint que les serveurs (`192.168.30.0/24`) et Internet.
+- `eth1.30` : les serveurs ne sortent que vers Internet.
+- `eth0` : le trafic venant de l'agence. Agence-R2 lui-même (`10.0.0.2`) peut sortir, par exemple pour ses mises à jour. Les utilisateurs de l'agence (`192.168.110.0/24`) joignent les serveurs et Internet, et les invités (`192.168.120.0/24`) Internet seulement.
+
+**4. Les règles d'Agence-R2.** L'agence isole ses invités, le reste est filtré au siège.
+
+```
+iptables -F FORWARD
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -i eth1.20 -d 192.168.0.0/16 -j DROP
+iptables -A FORWARD -i eth1.20 -d 10.0.0.0/30 -j DROP
+iptables -A FORWARD -i eth1.20 -o eth0 -j ACCEPT
+iptables -A FORWARD -i eth1.10 -j ACCEPT
+iptables -A FORWARD -i eth0 -j ACCEPT
+iptables -A FORWARD -j DROP
+```
+
+- Les deux règles `DROP` sur `eth1.20` interdisent aux invités tous les réseaux internes (`192.168.0.0/16`, qui couvre le siège et l'agence) ainsi que le lien WAN. Elles sont placées **avant** la règle qui autorise la sortie, sinon elles ne serviraient à rien.
+- Les invités ne peuvent ensuite sortir que vers le siège (`eth0`), qui les envoie vers Internet.
+- Le trafic des utilisateurs de l'agence (`eth1.10`) est accepté ici et filtré ensuite par Siege-R1. Le trafic qui arrive du siège (`eth0`) est accepté ici car il a déjà été filtré là-bas.
+
+**5. Persistance.** Les règles iptables sont en mémoire et disparaissent au redémarrage. Comme pour les VLAN et le NAT, elles sont posées au démarrage par un script `/etc/local.d/firewall.start` (voir `configs/siege-r1-firewall.start` et `configs/agence-r2-firewall.start`). Il commence par `iptables -F FORWARD`, ce qui permet de le relancer à la main sans créer de doublons.
+
+```
+cat > /etc/local.d/firewall.start << 'EOF'
+#!/bin/sh
+iptables -F FORWARD
+(les règles du routeur, voir ci-dessus, sans la première ligne)
+EOF
+chmod +x /etc/local.d/firewall.start
+/etc/local.d/firewall.start
+iptables -L FORWARD -n -v --line-numbers
+sync
+```
+
+![Pose des règles sur Siege-R1](captures/36-acl-siege-r1-regles.png)
+
+**6. Tests.** Les tests sont résumés dans la section 6. Les compteurs montrent que les règles `DROP` sont bien celles qui bloquent le trafic interdit.
+
+![PC-Compta : Internet et serveurs OK, Direction bloquée](captures/37-acl-pc-compta.png)
+![SRV-1 : Internet OK, Direction et Compta bloquées](captures/38-acl-srv1.png)
+![Compteurs de Siege-R1, DROP supérieur à 0](captures/39-acl-compteurs-siege-r1.png)
+![PC-Invite : Internet seulement](captures/40-acl-pc-invite.png)
+![PC-Agence1 : Internet et serveurs, Direction et Compta bloquées](captures/41-acl-pc-agence1.png)
+![Compteurs d'Agence-R2, DROP des invités supérieur à 0](captures/42-acl-compteurs-agence-r2.png)
+
+**7. Après redémarrage.** Les deux routeurs ont été redémarrés : `firewall.start` recharge automatiquement les 10 règles de Siege-R1 et les 7 règles d'Agence-R2, avec les compteurs repartis à zéro.
+
+![Siege-R1 après redémarrage](captures/43-acl-apres-redemarrage-siege-r1.png)
+![Agence-R2 après redémarrage](captures/44-acl-apres-redemarrage-agence-r2.png)
+
 ## 6. Tests et validation
 
 | Test | Résultat |
@@ -418,6 +509,17 @@ sync
 | PC-Invite : `ip dhcp` puis `ping google.com` | Adresse `192.168.120.164`, DNS `192.168.120.1`, ping OK |
 | DHCP et DNS sur les 4 postes après redémarrage des routeurs | OK |
 | Tous les tests après redémarrage des routeurs | OK |
+| ACL : PC-Direction vers `google.com`, SRV-1 et PC-Compta | OK, la Direction atteint tout |
+| ACL : PC-Compta vers `google.com` et SRV-1 | OK |
+| ACL : PC-Compta vers PC-Direction | Timeout, bloqué par Siege-R1 |
+| ACL : SRV-1 vers `8.8.8.8` | OK |
+| ACL : SRV-1 vers PC-Direction et PC-Compta | Timeout, bloqué par Siege-R1 |
+| ACL : PC-Agence1 vers `google.com` et SRV-1 | OK, TTL 62 vers SRV-1 |
+| ACL : PC-Agence1 vers PC-Direction et PC-Compta | Timeout, bloqué par Siege-R1 |
+| ACL : PC-Invite vers `google.com` | OK |
+| ACL : PC-Invite vers SRV-1, PC-Agence1 et PC-Direction | Timeout, bloqué par Agence-R2 |
+| Compteurs des règles `DROP` | Siege-R1 : 20 paquets bloqués (règle 10). Agence-R2 : 30 paquets bloqués (règle 2) |
+| Règles iptables après redémarrage des routeurs | Rechargées par `firewall.start` (10 règles sur Siege-R1, 7 sur Agence-R2) |
 
 Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paquets traversent un routeur : le routage entre VLAN fonctionne. Le TTL de 62 vers l'agence montre qu'ils en traversent deux (Siege-R1 puis Agence-R2) : le routage entre les deux sites fonctionne.
 
@@ -438,6 +540,8 @@ Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paq
 | Console d'un routeur qui se ferme en boucle, port 5000 injoignable en `telnet` | Le serveur GNS3 ne relançait plus correctement la console du nœud | Fermeture puis relance de GNS3, qui a rétabli la console. Un `ping` de la GNS3 VM permet de vérifier qu'elle répond |
 | Pas de résolution de noms sur Siege-R1 alors que le ping vers `8.8.8.8` fonctionnait | `/etc/resolv.conf` vide, donc dnsmasq n'avait aucun serveur DNS vers qui relayer | Ajout de `no-resolv` et `server=8.8.8.8` dans `dnsmasq.conf` : le DNS des clients ne dépend plus de `resolv.conf`. Après redémarrage, `udhcpc` remplit `resolv.conf` tout seul avec le DNS du nœud NAT |
 | GNS3 VM figée (`rcu_preempt kthread starved`) puis un routeur en `kernel panic` au démarrage (« IO-APIC + timer doesn't work ») | Hôte saturé, le noyau n'obtenait plus assez de temps CPU pour initialiser son timer | Arrêt propre des nœuds et de la GNS3 VM, passage de la VM de 4 à 2 vCPU, redémarrage des nœuds un par un |
+| Après la pose des ACL, PC-Direction ne résolvait pas `google.com` (DNS vide) et ses pings vers PC-Compta et SRV-1 étaient en timeout | Le poste avait perdu son bail DHCP, et PC-Compta (même problème) et SRV-1 n'étaient pas démarrés. Ce n'était pas l'ACL : la Direction a le droit de tout atteindre | `ip dhcp` sur les postes concernés, démarrage des machines manquantes, puis nouveaux tests |
+| Premier `ping google.com` en échec sur PC-Invite (« Cannot resolve »), puis quelques timeouts passagers sur PC-Compta, qui disparaissent d'eux-mêmes | Pas une règle ACL, puisque les règles bloquent toujours de la même façon. Cause probable : requête DNS partie avant la résolution ARP de la passerelle, ou charge passagère de la GNS3 VM (non confirmé) | Nouvel essai du ping. Si le problème se répète, comparer le compteur du `DROP` avant et après pour savoir si une règle est en cause |
 | Voisin OSPF absent sur Agence-R2, route par défaut non reçue | Siege-R1 n'était pas démarré, il n'y avait donc personne avec qui échanger | Démarrage de Siege-R1 : voisin `Full` et route `0.0.0.0/0` reçue au bout de quelques minutes |
 
 ## 8. Limites connues
@@ -445,6 +549,8 @@ Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paq
 - L'absence de KVM ralentit fortement le démarrage des routeurs (plusieurs minutes chacun).
 - Le nom d'hôte FRR repasse à `frr` après un redémarrage. C'est cosmétique et sans effet sur le réseau.
 - Les scripts de démarrage doivent être créés sur chaque nouveau routeur.
+- Les invités sont isolés pour les connexions qu'ils initient, mais rien n'empêche la Direction ou les utilisateurs de l'agence de les joindre.
+- Les règles de filtrage sont écrites à la main dans `firewall.start` : si une plage d'adresses change, il faut mettre à jour le script de chaque routeur concerné.
 - Les arrêts brutaux de la GNS3 VM peuvent corrompre un fichier : il faut arrêter les nœuds avec **Stop**, enregistrer le projet (Ctrl+S), puis arrêter la VM proprement.
 
 ## 9. Suite du projet
@@ -454,6 +560,6 @@ Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paq
 - [x] Rendre les VLAN persistants au démarrage
 - [x] NAT vers un accès « Internet » simulé, avec route par défaut diffusée en OSPF
 - [x] DHCP et DNS (dnsmasq sur chaque routeur)
-- [ ] Filtrage entre VLAN avec des ACL
+- [x] Filtrage entre VLAN avec des ACL (iptables sur les deux routeurs)
 - [ ] VPN site à site
 - [ ] Supervision et sauvegarde automatisée des configurations (sauvegarde manuelle déjà faite dans `configs/`)

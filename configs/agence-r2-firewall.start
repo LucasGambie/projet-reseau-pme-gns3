@@ -1,0 +1,9 @@
+#!/bin/sh
+iptables -F FORWARD
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -i eth1.20 -d 192.168.0.0/16 -j DROP
+iptables -A FORWARD -i eth1.20 -d 10.0.0.0/30 -j DROP
+iptables -A FORWARD -i eth1.20 -o eth0 -j ACCEPT
+iptables -A FORWARD -i eth1.10 -j ACCEPT
+iptables -A FORWARD -i eth0 -j ACCEPT
+iptables -A FORWARD -j DROP
