@@ -2,7 +2,7 @@
 
 Projet personnel de conception et de mise en place d'une infrastructure réseau d'entreprise, entièrement virtualisée avec GNS3 : un siège et une agence reliés par un lien WAN, avec segmentation en VLAN et routage dynamique entre les sites.
 
-> **État d'avancement** : les deux sites sont opérationnels (VLAN, passerelles, routage inter-VLAN), reliés par OSPF, et sortent sur Internet par un NAT au siège. Les configurations survivent à un redémarrage des routeurs. Le DHCP, le DNS et le filtrage entre VLAN (ACL) sont en place sur les deux sites. La suite est détaillée dans la section « Suite du projet ».
+> **État d'avancement** : les deux sites sont opérationnels (VLAN, passerelles, routage inter-VLAN), reliés par OSPF, et sortent sur Internet par un NAT au siège. Les configurations survivent à un redémarrage des routeurs. Le DHCP, le DNS, le filtrage entre VLAN (ACL) et le VPN site à site (WireGuard) sont en place sur les deux sites. La suite est détaillée dans la section « Suite du projet ».
 
 ---
 
@@ -16,6 +16,7 @@ Projet personnel de conception et de mise en place d'une infrastructure réseau 
 - Rendre les configurations persistantes après un redémarrage
 - Distribuer les adresses (DHCP) et résoudre les noms (DNS) sur chaque site, avec un serveur léger sur le routeur
 - Contrôler les flux entre les VLAN et vers Internet avec des règles de filtrage (iptables)
+- Chiffrer la liaison entre les deux sites avec un VPN site à site (WireGuard)
 - Documenter chaque étape, avec les tests et les problèmes rencontrés
 
 ## 2. Environnement
@@ -297,8 +298,12 @@ La configuration FRR est ensuite enregistrée avec `write memory` dans vtysh, pu
 | `agence-r2-vlan.start` | Script de démarrage d'Agence-R2 |
 | `siege-r1-dnsmasq.conf` | Configuration DHCP et DNS de Siege-R1 (voir 5.10) |
 | `agence-r2-dnsmasq.conf` | Configuration DHCP et DNS d'Agence-R2 (voir 5.10) |
-| `siege-r1-firewall.start` | Règles de filtrage de Siege-R1 (voir 5.11) |
-| `agence-r2-firewall.start` | Règles de filtrage d'Agence-R2 (voir 5.11) |
+| `siege-r1-firewall.start` | Règles de filtrage de Siege-R1 (voir 5.11, version avec VPN en 5.12) |
+| `agence-r2-firewall.start` | Règles de filtrage d'Agence-R2 (voir 5.11, version avec VPN en 5.12) |
+| `siege-r1-wg0.conf` | Configuration WireGuard de Siege-R1 (clé privée remplacée par un texte, voir 5.12) |
+| `agence-r2-wg0.conf` | Configuration WireGuard d'Agence-R2 (clé privée remplacée par un texte, voir 5.12) |
+| `siege-r1-vpn.start` | Démarrage du tunnel au boot de Siege-R1 |
+| `agence-r2-vpn.start` | Démarrage du tunnel au boot d'Agence-R2 |
 
 ### 5.9 NAT et accès à Internet
 
@@ -403,6 +408,8 @@ sync
 
 Les routeurs sont des Alpine Linux : il n'y a pas d'ACL « à la Cisco », le filtrage se fait avec **iptables**, sur la chaîne `FORWARD`, qui contient le trafic traversant le routeur. Le trafic destiné au routeur lui-même (DHCP, DNS) passe par une autre chaîne (`INPUT`) et n'est donc pas touché par ces règles.
 
+> Cette section décrit la **première version** des règles, avant le VPN. À l'étape 5.12, le trafic de l'agence arrive par le tunnel `wg0` au lieu de `eth0` : les scripts `firewall.start` sont alors mis à jour (version finale dans la section 5.12).
+
 **1. La politique.**
 
 | Source | Peut atteindre | Bloqué |
@@ -487,6 +494,139 @@ sync
 ![Siege-R1 après redémarrage](captures/43-acl-apres-redemarrage-siege-r1.png)
 ![Agence-R2 après redémarrage](captures/44-acl-apres-redemarrage-agence-r2.png)
 
+### 5.12 VPN site à site (WireGuard)
+
+Le lien entre les deux sites (`10.0.0.0/30`) transporte jusqu'ici le trafic en clair. Un tunnel **WireGuard** le chiffre. WireGuard est léger, présent dans le noyau d'Alpine (module `wireguard`) et se configure avec un seul petit fichier par routeur.
+
+**1. Plan du tunnel.**
+
+| Élément | Siege-R1 | Agence-R2 |
+|---|---|---|
+| Adresse du tunnel (`wg0`) | `10.10.10.1/30` | `10.10.10.2/30` |
+| Port d'écoute | UDP 51820 | UDP 51820 |
+| Adresse de l'autre bout (`Endpoint`) | `10.0.0.2:51820` | `10.0.0.1:51820` |
+
+**2. Choix de conception : tunnel complet pour l'agence.** Tout le trafic de l'agence (réseaux du siège et Internet) passe par le tunnel. Le lien `eth0` ne sert plus qu'à transporter le tunnel lui-même et l'OSPF. Ce choix évite un problème de chemin aller/retour rencontré lors des essais (voir la section 7) et empêche de contourner le chiffrement.
+
+**3. Installation et clés.** Sur chaque routeur, `wireguard-tools` est installé puis une paire de clés est générée. La clé privée reste sur le routeur, seule la clé publique est copiée sur l'autre.
+
+```
+apk add wireguard-tools
+mkdir -p /etc/wireguard
+cd /etc/wireguard
+umask 077
+wg genkey | tee siege-r1.key | wg pubkey > siege-r1.pub
+```
+
+![Installation et clés de Siege-R1](captures/45-vpn-cles-siege-r1.png)
+
+**4. Configuration.** Le fichier `/etc/wireguard/wg0.conf` est créé sur chaque routeur. La clé privée y est insérée par une commande (`$(cat siege-r1.key)`), sans jamais s'afficher à l'écran, et le fichier est protégé par `chmod 600`. Dans le dépôt, les fichiers `configs/*-wg0.conf` contiennent un texte à la place de la clé privée : **aucune clé privée n'est publiée**.
+
+Siege-R1 :
+
+```
+[Interface]
+Address = 10.10.10.1/30
+ListenPort = 51820
+PrivateKey = <clé privée de Siege-R1>
+
+[Peer]
+PublicKey = RSRUpwD54e6Bwg3QY3D/WpPQyeWZEBVHS9WQLctI+SE=
+Endpoint = 10.0.0.2:51820
+AllowedIPs = 10.10.10.2/32, 192.168.110.0/24, 192.168.120.0/24
+```
+
+Agence-R2 :
+
+```
+[Interface]
+Address = 10.10.10.2/30
+ListenPort = 51820
+PrivateKey = <clé privée d'Agence-R2>
+Table = off
+PostUp = ip route add 192.168.10.0/24 dev wg0
+PostUp = ip route add 192.168.20.0/24 dev wg0
+PostUp = ip route add 192.168.30.0/24 dev wg0
+PostUp = ip route add default dev wg0 metric 5
+
+[Peer]
+PublicKey = nS5KpW8shIctvyfG4UW4GjTf7HzDNUXjYbKGNQbonHU=
+Endpoint = 10.0.0.1:51820
+AllowedIPs = 0.0.0.0/0
+```
+
+- `AllowedIPs` indique quelles adresses sont acceptées depuis le tunnel et lui sont envoyées. Au siège, ce sont les réseaux de l'agence. À l'agence, c'est tout (`0.0.0.0/0`), puisque tout passe par le siège.
+- `Table = off` : `wg-quick` n'ajoute pas ses propres routes, on les ajoute à la main avec les `PostUp`. La route par défaut via `wg0` a une métrique de 5, plus basse que celle de l'OSPF (20), donc elle est préférée. Le trafic vers `10.0.0.1` (le tunnel lui-même) reste sur `eth0`, car la route directe `10.0.0.0/30` est plus précise que la route par défaut.
+
+![wg0.conf de Siege-R1 (sans la clé privée)](captures/46-vpn-wg0-conf-siege-r1.png)
+![wg0.conf d'Agence-R2 (sans la clé privée)](captures/47-vpn-wg0-conf-agence-r2.png)
+
+**5. Montée du tunnel.** `wg-quick up wg0` sur chaque routeur, puis `wg show`. La ligne `latest handshake` prouve que les deux routeurs se sont reconnus avec leurs clés, et `ip route get` vérifie le chemin emprunté : Internet part par `wg0`, le tunnel lui-même par `eth0`.
+
+![Tunnel monté sur Siege-R1](captures/48-vpn-tunnel-siege-r1.png)
+![Tunnel monté sur Agence-R2](captures/49-vpn-tunnel-agence-r2.png)
+
+**6. Premier essai et diagnostic.** Avec une première version du tunnel (seulement les réseaux du siège dans le tunnel), les postes de l'agence n'atteignaient plus Internet. Les captures ci-dessous montrent le diagnostic, expliqué dans la section 7.
+
+![Internet en timeout depuis PC-Agence1](captures/50-vpn-probleme-pc-agence1.png)
+![Diagnostic sur Siege-R1](captures/51-vpn-diagnostic-siege-r1.png)
+![Filtre de chemin inverse (rp_filter)](captures/52-vpn-diagnostic-rp-filter.png)
+
+**7. Adaptation des ACL.** Le trafic de l'agence arrive maintenant par `wg0` : les règles de la section 5.11 sont remplacées. Deux changements : les règles `eth0` pour l'agence sont remplacées par des règles `wg0`, de sorte que l'accès aux serveurs ne passe plus jamais en clair, et le réseau du tunnel (`10.10.10.0/30`) est interdit aux invités.
+
+Siege-R1 (10 règles) :
+
+```
+iptables -F FORWARD
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -i eth1.10 -j ACCEPT
+iptables -A FORWARD -i eth1.20 -d 192.168.30.0/24 -j ACCEPT
+iptables -A FORWARD -i eth1.20 -o eth2 -j ACCEPT
+iptables -A FORWARD -i eth1.30 -o eth2 -j ACCEPT
+iptables -A FORWARD -i wg0 -s 10.10.10.2 -o eth2 -j ACCEPT
+iptables -A FORWARD -i wg0 -s 192.168.110.0/24 -d 192.168.30.0/24 -j ACCEPT
+iptables -A FORWARD -i wg0 -s 192.168.110.0/24 -o eth2 -j ACCEPT
+iptables -A FORWARD -i wg0 -s 192.168.120.0/24 -o eth2 -j ACCEPT
+iptables -A FORWARD -j DROP
+```
+
+Agence-R2 (8 règles) :
+
+```
+iptables -F FORWARD
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -i eth1.20 -d 192.168.0.0/16 -j DROP
+iptables -A FORWARD -i eth1.20 -d 10.0.0.0/30 -j DROP
+iptables -A FORWARD -i eth1.20 -d 10.10.10.0/30 -j DROP
+iptables -A FORWARD -i eth1.20 -o wg0 -j ACCEPT
+iptables -A FORWARD -i eth1.10 -j ACCEPT
+iptables -A FORWARD -i wg0 -j ACCEPT
+iptables -A FORWARD -j DROP
+```
+
+![Règles de Siege-R1 avec le VPN](captures/53-vpn-acl-siege-r1.png)
+![Règles d'Agence-R2 avec le VPN](captures/54-vpn-acl-agence-r2.png)
+
+**8. Tests.** Les résultats sont résumés dans la section 6.
+
+![PC-Direction vers PC-Agence1 et Internet](captures/55-vpn-test-pc-direction.png)
+![PC-Agence1 : Internet et serveurs, Direction bloquée](captures/56-vpn-test-pc-agence1.png)
+![PC-Invite : Internet](captures/57-vpn-test-pc-invite.png)
+
+**9. Persistance.** Le tunnel est monté au démarrage par `/etc/local.d/vpn.start` (voir `configs/siege-r1-vpn.start` et `configs/agence-r2-vpn.start`). Les scripts de `local.d` s'exécutent dans l'ordre alphabétique, donc après `firewall.start` et `vlan.start`.
+
+```
+#!/bin/sh
+modprobe wireguard
+wg show wg0 > /dev/null 2>&1 || wg-quick up wg0
+```
+
+Après un redémarrage des deux routeurs, `wg0`, les règles et la route par défaut de l'agence sont rechargés, et le tunnel se rétablit dès que du trafic passe.
+
+![Siege-R1 après redémarrage](captures/58-vpn-apres-redemarrage-siege-r1.png)
+![Agence-R2 après redémarrage](captures/59-vpn-apres-redemarrage-agence-r2.png)
+![Handshake et compteurs après redémarrage](captures/60-vpn-handshake-siege-r1.png)
+
 ## 6. Tests et validation
 
 | Test | Résultat |
@@ -520,6 +660,14 @@ sync
 | ACL : PC-Invite vers SRV-1, PC-Agence1 et PC-Direction | Timeout, bloqué par Agence-R2 |
 | Compteurs des règles `DROP` | Siege-R1 : 20 paquets bloqués (règle 10). Agence-R2 : 30 paquets bloqués (règle 2) |
 | Règles iptables après redémarrage des routeurs | Rechargées par `firewall.start` (10 règles sur Siege-R1, 7 sur Agence-R2) |
+| VPN : `ping 10.10.10.1` depuis Agence-R2 | OK, handshake WireGuard établi |
+| VPN : `ip route get` sur Agence-R2 | Internet par `wg0`, tunnel (`10.0.0.1`) par `eth0` |
+| VPN : PC-Agence1 vers `google.com` et SRV-1 | OK, par le tunnel |
+| VPN : PC-Agence1 vers PC-Direction | Timeout, bloqué par Siege-R1 |
+| VPN : PC-Direction vers PC-Agence1 et `google.com` | OK, TTL 62 vers l'agence |
+| VPN : PC-Compta vers PC-Agence1 | Timeout, bloqué par Siege-R1 |
+| VPN : PC-Invite vers `google.com` | OK |
+| VPN : redémarrage des deux routeurs | `wg0`, règles et route par défaut rechargés, handshake établi, tests OK |
 
 Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paquets traversent un routeur : le routage entre VLAN fonctionne. Le TTL de 62 vers l'agence montre qu'ils en traversent deux (Siege-R1 puis Agence-R2) : le routage entre les deux sites fonctionne.
 
@@ -542,6 +690,8 @@ Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paq
 | GNS3 VM figée (`rcu_preempt kthread starved`) puis un routeur en `kernel panic` au démarrage (« IO-APIC + timer doesn't work ») | Hôte saturé, le noyau n'obtenait plus assez de temps CPU pour initialiser son timer | Arrêt propre des nœuds et de la GNS3 VM, passage de la VM de 4 à 2 vCPU, redémarrage des nœuds un par un |
 | Après la pose des ACL, PC-Direction ne résolvait pas `google.com` (DNS vide) et ses pings vers PC-Compta et SRV-1 étaient en timeout | Le poste avait perdu son bail DHCP, et PC-Compta (même problème) et SRV-1 n'étaient pas démarrés. Ce n'était pas l'ACL : la Direction a le droit de tout atteindre | `ip dhcp` sur les postes concernés, démarrage des machines manquantes, puis nouveaux tests |
 | Premier `ping google.com` en échec sur PC-Invite (« Cannot resolve »), puis quelques timeouts passagers sur PC-Compta, qui disparaissent d'eux-mêmes | Pas une règle ACL, puisque les règles bloquent toujours de la même façon. Cause probable : requête DNS partie avant la résolution ARP de la passerelle, ou charge passagère de la GNS3 VM (non confirmé) | Nouvel essai du ping. Si le problème se répète, comparer le compteur du `DROP` avant et après pour savoir si une règle est en cause |
+| Après la montée du tunnel, les postes de l'agence n'atteignaient plus Internet (`google.com` en timeout) | La requête partait en clair par `eth0`, mais Siege-R1 avait désormais une route plus prioritaire vers le réseau de l'agence par `wg0`. Le filtre de chemin inverse (`rp_filter = 1`, strict) rejetait les paquets arrivant par `eth0`, et la réponse serait de toute façon repartie par le tunnel, où elle aurait été refusée | Tunnel complet pour l'agence : `AllowedIPs = 0.0.0.0/0`, `Table = off` et routes ajoutées en `PostUp` sur Agence-R2, ACL en `-i wg0`. L'aller et le retour passent par le même chemin |
+| `wg-quick up wg0` répond `'wg0' already exists` | Le tunnel était déjà monté avec l'ancienne configuration | `wg-quick down wg0` puis `wg-quick up wg0` |
 | Voisin OSPF absent sur Agence-R2, route par défaut non reçue | Siege-R1 n'était pas démarré, il n'y avait donc personne avec qui échanger | Démarrage de Siege-R1 : voisin `Full` et route `0.0.0.0/0` reçue au bout de quelques minutes |
 
 ## 8. Limites connues
@@ -551,6 +701,8 @@ Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paq
 - Les scripts de démarrage doivent être créés sur chaque nouveau routeur.
 - Les invités sont isolés pour les connexions qu'ils initient, mais rien n'empêche la Direction ou les utilisateurs de l'agence de les joindre.
 - Les règles de filtrage sont écrites à la main dans `firewall.start` : si une plage d'adresses change, il faut mettre à jour le script de chaque routeur concerné.
+- Les clés privées WireGuard n'existent que sur les routeurs (`/etc/wireguard/*.key`). Si un routeur est reconstruit, il faut regénérer sa paire de clés et mettre à jour la clé publique de l'autre côté.
+- La route par défaut de l'agence passe par le tunnel : si le tunnel tombe, l'agence perd Internet et les réseaux du siège, sans bascule automatique sur `eth0`.
 - Les arrêts brutaux de la GNS3 VM peuvent corrompre un fichier : il faut arrêter les nœuds avec **Stop**, enregistrer le projet (Ctrl+S), puis arrêter la VM proprement.
 
 ## 9. Suite du projet
@@ -561,5 +713,5 @@ Le TTL de 64 vers la passerelle puis de 63 vers un autre VLAN montre que les paq
 - [x] NAT vers un accès « Internet » simulé, avec route par défaut diffusée en OSPF
 - [x] DHCP et DNS (dnsmasq sur chaque routeur)
 - [x] Filtrage entre VLAN avec des ACL (iptables sur les deux routeurs)
-- [ ] VPN site à site
+- [x] VPN site à site (WireGuard, tunnel complet pour l'agence)
 - [ ] Supervision et sauvegarde automatisée des configurations (sauvegarde manuelle déjà faite dans `configs/`)

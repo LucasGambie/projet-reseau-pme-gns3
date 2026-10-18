@@ -5,8 +5,8 @@ iptables -A FORWARD -i eth1.10 -j ACCEPT
 iptables -A FORWARD -i eth1.20 -d 192.168.30.0/24 -j ACCEPT
 iptables -A FORWARD -i eth1.20 -o eth2 -j ACCEPT
 iptables -A FORWARD -i eth1.30 -o eth2 -j ACCEPT
-iptables -A FORWARD -i eth0 -s 10.0.0.2 -o eth2 -j ACCEPT
-iptables -A FORWARD -i eth0 -s 192.168.110.0/24 -d 192.168.30.0/24 -j ACCEPT
-iptables -A FORWARD -i eth0 -s 192.168.110.0/24 -o eth2 -j ACCEPT
-iptables -A FORWARD -i eth0 -s 192.168.120.0/24 -o eth2 -j ACCEPT
+iptables -A FORWARD -i wg0 -s 10.10.10.2 -o eth2 -j ACCEPT
+iptables -A FORWARD -i wg0 -s 192.168.110.0/24 -d 192.168.30.0/24 -j ACCEPT
+iptables -A FORWARD -i wg0 -s 192.168.110.0/24 -o eth2 -j ACCEPT
+iptables -A FORWARD -i wg0 -s 192.168.120.0/24 -o eth2 -j ACCEPT
 iptables -A FORWARD -j DROP
